@@ -1,0 +1,28 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and create DMG
+        run: make dist
+
+      - name: Show build artifacts
+        run: |
+          ls -lh macmon.app/Contents/MacOS/macmon
+          ls -lh macmon.dmg
+          codesign -dv macmon.app 2>&1
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macmon.dmg
+          path: macmon.dmg
