@@ -14,6 +14,6 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>GIT_SHA</string>
 </dict>
 </plist>

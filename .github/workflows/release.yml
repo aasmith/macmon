@@ -15,8 +15,11 @@ jobs:
       - name: Build and create DMG
         run: make dist
 
+      - name: Rename DMG with version
+        run: mv macmon.dmg macmon-${{ github.ref_name }}.dmg
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: macmon.dmg
+          files: macmon-${{ github.ref_name }}.dmg
           generate_release_notes: true

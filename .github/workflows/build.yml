@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -21,8 +23,23 @@ jobs:
           ls -lh macmon.dmg
           codesign -dv macmon.app 2>&1
 
-      - name: Upload DMG
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: macmon.dmg
           path: macmon.dmg
+
+      - name: Update latest release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          body: |
+            Built from `main` at ${{ github.sha }}.
+
+            Download `macmon.dmg`, open it, and drag macmon to Applications.
+            Right-click → Open on first launch (ad-hoc signed, not notarized).
+          files: macmon.dmg
+          prerelease: true
+          make_latest: false

@@ -513,6 +513,16 @@ static NSImage *render_per_core_graphs(CPUState *state,
     [intervalItem setSubmenu:intervalMenu];
     [menu addItem:intervalItem];
 
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // Version
+    NSMenuItem *verItem = [[NSMenuItem alloc] initWithTitle:
+        [NSString stringWithFormat:@"macmon %s", GIT_SHA]
+                                                     action:nil
+                                              keyEquivalent:@""];
+    [verItem setEnabled:NO];
+    [menu addItem:verItem];
+
     return menu;
 }
 
