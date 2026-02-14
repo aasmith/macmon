@@ -9,6 +9,8 @@
     <string>com.local.macmon</string>
     <key>CFBundleName</key>
     <string>macmon</string>
+    <key>CFBundleIconFile</key>
+    <string>macmon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
