@@ -40,13 +40,17 @@ typedef struct {
     float    aggregate;       // overall  0.0–1.0
 } CPUState;
 
+static mach_port_t host_port = 0;
+
 static void sample_cpu(CPUState *state) {
     processor_info_array_t cpuInfo;
     mach_msg_type_number_t numCpuInfo;
     natural_t numCPUs = 0;
 
+    if (!host_port) host_port = mach_host_self();
+
     kern_return_t err = host_processor_info(
-        mach_host_self(),
+        host_port,
         PROCESSOR_CPU_LOAD_INFO,
         &numCPUs,
         &cpuInfo,
@@ -138,6 +142,34 @@ static void usage_color(float u, CGFloat *r, CGFloat *g, CGFloat *b) {
 // Rendering
 // ============================================================================
 
+// Shared rendering context — created once, reused every frame
+static CGColorSpaceRef g_colorSpace = NULL;
+static CGContextRef    g_ctx = NULL;
+static uint8_t        *g_pixels = NULL;
+
+static CGContextRef get_render_ctx(void) {
+    if (!g_ctx) {
+        g_colorSpace = CGColorSpaceCreateDeviceRGB();
+        g_pixels = calloc(ICON_PX * ICON_PX * 4, 1);
+        g_ctx = CGBitmapContextCreate(
+            g_pixels, ICON_PX, ICON_PX, 8, ICON_PX * 4,
+            g_colorSpace, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    }
+    // Reset state: clear pixels and reset clip/CTM
+    CGContextRestoreGState(g_ctx);  // pop any saved state (no-op if empty)
+    CGContextSaveGState(g_ctx);     // save clean state for next frame
+    memset(g_pixels, 0, ICON_PX * ICON_PX * 4);
+    return g_ctx;
+}
+
+static NSImage *finish_render(void) {
+    CGImageRef cgImg = CGBitmapContextCreateImage(g_ctx);
+    NSImage *img = [[NSImage alloc] initWithCGImage:cgImg
+                                               size:NSMakeSize(ICON_PTS, ICON_PTS)];
+    CGImageRelease(cgImg);
+    return img;
+}
+
 static void draw_rounded_bg(CGContextRef ctx, int w, int h) {
     CGFloat radius = w * 0.12f;
     CGRect rect = CGRectMake(0, 0, w, h);
@@ -162,10 +194,7 @@ static void draw_gridlines(CGContextRef ctx, int w, float pad_bottom, float grap
 
 static NSImage *render_aggregate(float *history) {
     int w = ICON_PX, h = ICON_PX;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        NULL, w, h, 8, 0, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-    CGColorSpaceRelease(cs);
+    CGContextRef ctx = get_render_ctx();
 
     draw_rounded_bg(ctx, w, h);
 
@@ -199,20 +228,12 @@ static NSImage *render_aggregate(float *history) {
     }
     CGContextStrokePath(ctx);
 
-    CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
-    NSImage *img = [[NSImage alloc] initWithCGImage:cgImg
-                                               size:NSMakeSize(ICON_PTS, ICON_PTS)];
-    CGImageRelease(cgImg);
-    CGContextRelease(ctx);
-    return img;
+    return finish_render();
 }
 
 static NSImage *render_per_core(CPUState *state, CoreTopology *topo) {
     int w = ICON_PX, h = ICON_PX;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        NULL, w, h, 8, 0, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-    CGColorSpaceRelease(cs);
+    CGContextRef ctx = get_render_ctx();
 
     draw_rounded_bg(ctx, w, h);
 
@@ -255,12 +276,7 @@ static NSImage *render_per_core(CPUState *state, CoreTopology *topo) {
             x += gap;
     }
 
-    CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
-    NSImage *img = [[NSImage alloc] initWithCGImage:cgImg
-                                               size:NSMakeSize(ICON_PTS, ICON_PTS)];
-    CGImageRelease(cgImg);
-    CGContextRelease(ctx);
-    return img;
+    return finish_render();
 }
 
 static void draw_mini_graph(CGContextRef ctx, float *hist, int len,
@@ -295,10 +311,7 @@ static NSImage *render_per_core_graphs(CPUState *state,
                                        float per_core_history[][HISTORY_LEN],
                                        CoreTopology *topo) {
     int w = ICON_PX, h = ICON_PX;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        NULL, w, h, 8, 0, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-    CGColorSpaceRelease(cs);
+    CGContextRef ctx = get_render_ctx();
 
     draw_rounded_bg(ctx, w, h);
 
@@ -353,12 +366,7 @@ static NSImage *render_per_core_graphs(CPUState *state,
                         ox, oy, cell_w, cell_h, (float)r, (float)g, (float)b);
     }
 
-    CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
-    NSImage *img = [[NSImage alloc] initWithCGImage:cgImg
-                                               size:NSMakeSize(ICON_PTS, ICON_PTS)];
-    CGImageRelease(cgImg);
-    CGContextRelease(ctx);
-    return img;
+    return finish_render();
 }
 
 // ============================================================================
@@ -373,6 +381,7 @@ static NSImage *render_per_core_graphs(CPUState *state,
     DisplayMode  _mode;
     NSTimeInterval _interval;
     NSTimer     *_timer;
+    id<NSObject> _activity;  // App Nap prevention token
 }
 @end
 
@@ -395,13 +404,19 @@ static NSImage *render_per_core_graphs(CPUState *state,
 
     [self updateIcon];
 
-    _timer = [NSTimer scheduledTimerWithTimeInterval:UPDATE_SEC
-                                              target:self
-                                            selector:@selector(tick:)
-                                            userInfo:nil
-                                             repeats:YES];
-    // Keep timer firing during event tracking (e.g. while dock menu is open)
+    _timer = [NSTimer timerWithTimeInterval:_interval
+                                     target:self
+                                   selector:@selector(tick:)
+                                   userInfo:nil
+                                    repeats:YES];
+    [_timer setTolerance:_interval * 0.1];
     [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
+
+    // Prevent App Nap from throttling our timer (we have no windows, so
+    // macOS would consider us fully occluded and aggressively nap us)
+    _activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                          reason:@"Dock CPU monitor updating"];
 }
 
 - (void)tick:(NSTimer *)t {
@@ -509,16 +524,19 @@ static NSImage *render_per_core_graphs(CPUState *state,
 - (void)selectInterval:(NSMenuItem *)sender {
     _interval = (NSTimeInterval)[sender tag];
     [_timer invalidate];
-    _timer = [NSTimer scheduledTimerWithTimeInterval:_interval
-                                              target:self
-                                            selector:@selector(tick:)
-                                            userInfo:nil
-                                             repeats:YES];
+    _timer = [NSTimer timerWithTimeInterval:_interval
+                                     target:self
+                                   selector:@selector(tick:)
+                                   userInfo:nil
+                                    repeats:YES];
+    [_timer setTolerance:_interval * 0.1];
     [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
+    if (_activity)
+        [[NSProcessInfo processInfo] endActivity:_activity];
     return NSTerminateNow;
 }
 
