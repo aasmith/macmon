@@ -2,6 +2,7 @@
 #import <mach/mach_host.h>
 #import <mach/processor_info.h>
 #import <mach/vm_map.h>
+#import <sys/sysctl.h>
 
 // ============================================================================
 // Constants
@@ -86,19 +87,51 @@ static void sample_cpu(CPUState *state) {
 }
 
 // ============================================================================
+// Core Topology (P-cores vs E-cores)
+// ============================================================================
+
+typedef struct {
+    unsigned int p_cores;  // perflevel0 count (Performance)
+    unsigned int e_cores;  // perflevel1 count (Efficiency)
+} CoreTopology;
+
+static int sysctl_int(const char *name) {
+    int val = 0;
+    size_t len = sizeof(val);
+    if (sysctlbyname(name, &val, &len, NULL, 0) != 0) return 0;
+    return val;
+}
+
+static CoreTopology query_topology(void) {
+    CoreTopology t = {0, 0};
+    int nlevels = sysctl_int("hw.nperflevels");
+    if (nlevels >= 1) t.p_cores = (unsigned)sysctl_int("hw.perflevel0.logicalcpu");
+    if (nlevels >= 2) t.e_cores = (unsigned)sysctl_int("hw.perflevel1.logicalcpu");
+    return t;
+}
+
+static int is_e_core(unsigned cpu_index, CoreTopology *topo) {
+    if (topo->e_cores == 0) return 0;  // no heterogeneous topology
+    return cpu_index >= topo->p_cores;
+}
+
+// ============================================================================
 // Color helpers
 // ============================================================================
 
 static void usage_color(float u, CGFloat *r, CGFloat *g, CGFloat *b) {
-    // green → yellow → red
+    // green → amber/gold → red
     if (u < 0.5f) {
-        *r = u * 2.0f;
+        float t = u * 2.0f;
+        *r = t;
         *g = 1.0f;
+        *b = 0.0f;
     } else {
+        float t = (u - 0.5f) * 2.0f;
         *r = 1.0f;
-        *g = 1.0f - (u - 0.5f) * 2.0f;
+        *g = 1.0f - t * 0.7f;  // holds more warmth through the middle
+        *b = 0.0f;
     }
-    *b = 0.0f;
 }
 
 // ============================================================================
@@ -111,13 +144,13 @@ static void draw_rounded_bg(CGContextRef ctx, int w, int h) {
     CGPathRef path = CGPathCreateWithRoundedRect(rect, radius, radius, NULL);
     CGContextAddPath(ctx, path);
     CGContextClip(ctx);
-    CGContextSetRGBFillColor(ctx, 0.1f, 0.1f, 0.1f, 1.0f);
+    CGContextSetRGBFillColor(ctx, 0.0f, 0.0f, 0.0f, 1.0f);
     CGContextFillRect(ctx, rect);
     CGPathRelease(path);
 }
 
 static void draw_gridlines(CGContextRef ctx, int w, float pad_bottom, float graph_h) {
-    CGContextSetRGBStrokeColor(ctx, 0.3f, 0.3f, 0.3f, 0.4f);
+    CGContextSetRGBStrokeColor(ctx, 0.4f, 0.4f, 0.4f, 0.6f);
     CGContextSetLineWidth(ctx, 1.0f);
     for (int i = 1; i <= 3; i++) {
         float y = pad_bottom + graph_h * (i / 4.0f);
@@ -174,7 +207,7 @@ static NSImage *render_aggregate(float *history) {
     return img;
 }
 
-static NSImage *render_per_core(CPUState *state) {
+static NSImage *render_per_core(CPUState *state, CoreTopology *topo) {
     int w = ICON_PX, h = ICON_PX;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
@@ -190,18 +223,36 @@ static NSImage *render_per_core(CPUState *state) {
     if (n == 0) n = 1;
 
     float gap = (n <= 16) ? 2.0f : 1.0f;
-    float bar_w = (area_w - gap * (n - 1)) / n;
+    float group_gap = (topo->e_cores > 0) ? gap * 3.0f : 0.0f;
+    float total_gaps = gap * (n - 1) + (topo->e_cores > 0 ? group_gap - gap : 0);
+    float bar_w = (area_w - total_gaps) / n;
     if (bar_w < 1.0f) bar_w = 1.0f;
 
+    float x = pad;
     for (unsigned i = 0; i < n; i++) {
-        float x = pad + i * (bar_w + gap);
         float bar_h = area_h * state->usage[i];
         if (bar_h < 1.0f && state->usage[i] > 0.01f) bar_h = 1.0f;
 
+        int e = is_e_core(i, topo);
         CGFloat r, g, b;
         usage_color(state->usage[i], &r, &g, &b);
-        CGContextSetRGBFillColor(ctx, r, g, b, 0.9f);
+        CGContextSetRGBFillColor(ctx, r, g, b, e ? 0.55f : 0.9f);
         CGContextFillRect(ctx, CGRectMake(x, pad, bar_w, bar_h));
+
+        // E-core marker: short rectangle at base of bar
+        if (e) {
+            float mark_h = 3.0f;
+            CGContextSetRGBFillColor(ctx, 0.2f, 0.35f, 1.0f, 0.9f);
+            CGContextFillRect(ctx, CGRectMake(x, pad - mark_h - 2.0f,
+                                              bar_w, mark_h));
+        }
+
+        x += bar_w;
+        // wider gap at P/E boundary
+        if (topo->e_cores > 0 && i + 1 == topo->p_cores)
+            x += group_gap;
+        else
+            x += gap;
     }
 
     CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
@@ -241,7 +292,8 @@ static void draw_mini_graph(CGContextRef ctx, float *hist, int len,
 }
 
 static NSImage *render_per_core_graphs(CPUState *state,
-                                       float per_core_history[][HISTORY_LEN]) {
+                                       float per_core_history[][HISTORY_LEN],
+                                       CoreTopology *topo) {
     int w = ICON_PX, h = ICON_PX;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
@@ -280,9 +332,19 @@ static NSImage *render_per_core_graphs(CPUState *state,
         float ox = pad + col * (cell_w + gap);
         float oy = pad + (rows - 1 - row) * (cell_h + gap);
 
-        // cell background
-        CGContextSetRGBFillColor(ctx, 0.15f, 0.15f, 0.15f, 1.0f);
+        // cell background: jet black, E-cores get electric blue
+        int e = is_e_core(i, topo);
+        if (e)
+            CGContextSetRGBFillColor(ctx, 0.06f, 0.06f, 0.3f, 1.0f);
+        else
+            CGContextSetRGBFillColor(ctx, 0.0f, 0.0f, 0.0f, 1.0f);
         CGContextFillRect(ctx, CGRectMake(ox, oy, cell_w, cell_h));
+
+        // E-core: blue bottom edge
+        if (e) {
+            CGContextSetRGBFillColor(ctx, 0.2f, 0.35f, 1.0f, 0.8f);
+            CGContextFillRect(ctx, CGRectMake(ox, oy, cell_w, 2.0f));
+        }
 
         // line color based on current usage
         CGFloat r, g, b;
@@ -304,11 +366,12 @@ static NSImage *render_per_core_graphs(CPUState *state,
 // ============================================================================
 
 @interface AppDelegate : NSObject <NSApplicationDelegate> {
-    CPUState    _cpuState;
-    float       _history[HISTORY_LEN];
-    float       _perCoreHistory[MAX_CPUS][HISTORY_LEN];
-    DisplayMode _mode;
-    NSTimer    *_timer;
+    CPUState     _cpuState;
+    CoreTopology _topo;
+    float        _history[HISTORY_LEN];
+    float        _perCoreHistory[MAX_CPUS][HISTORY_LEN];
+    DisplayMode  _mode;
+    NSTimer     *_timer;
 }
 @end
 
@@ -319,6 +382,7 @@ static NSImage *render_per_core_graphs(CPUState *state,
     memset(&_cpuState, 0, sizeof(_cpuState));
     memset(_history,   0, sizeof(_history));
     memset(_perCoreHistory, 0, sizeof(_perCoreHistory));
+    _topo = query_topology();
     _mode = DisplayModeAggregate;
 
     // Two samples so deltas are valid on first render
@@ -358,10 +422,10 @@ static NSImage *render_per_core_graphs(CPUState *state,
             icon = render_aggregate(_history);
             break;
         case DisplayModePerCore:
-            icon = render_per_core(&_cpuState);
+            icon = render_per_core(&_cpuState, &_topo);
             break;
         case DisplayModePerCoreGraphs:
-            icon = render_per_core_graphs(&_cpuState, _perCoreHistory);
+            icon = render_per_core_graphs(&_cpuState, _perCoreHistory, &_topo);
             break;
         default:
             icon = render_aggregate(_history);
@@ -383,8 +447,13 @@ static NSImage *render_per_core_graphs(CPUState *state,
     NSMenu *menu = [[NSMenu alloc] init];
 
     // CPU info (disabled)
-    NSString *info = [NSString stringWithFormat:@"CPU: %.0f%% (%u cores)",
-                      _cpuState.aggregate * 100.0f, _cpuState.num_cpus];
+    NSString *info;
+    if (_topo.e_cores > 0)
+        info = [NSString stringWithFormat:@"CPU: %.0f%% (%uP + %uE)",
+                _cpuState.aggregate * 100.0f, _topo.p_cores, _topo.e_cores];
+    else
+        info = [NSString stringWithFormat:@"CPU: %.0f%% (%u cores)",
+                _cpuState.aggregate * 100.0f, _cpuState.num_cpus];
     NSMenuItem *infoItem = [[NSMenuItem alloc] initWithTitle:info
                                                       action:nil
                                                keyEquivalent:@""];
