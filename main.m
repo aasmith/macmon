@@ -405,14 +405,6 @@ static NSImage *render_per_core_graphs(CPUState *state,
         [menu addItem:item];
     }
 
-    [menu addItem:[NSMenuItem separatorItem]];
-
-    // Exit
-    NSMenuItem *exitItem = [[NSMenuItem alloc] initWithTitle:@"Exit"
-                                                      action:@selector(terminate:)
-                                               keyEquivalent:@""];
-    [menu addItem:exitItem];
-
     return menu;
 }
 
