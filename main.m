@@ -371,6 +371,7 @@ static NSImage *render_per_core_graphs(CPUState *state,
     float        _history[HISTORY_LEN];
     float        _perCoreHistory[MAX_CPUS][HISTORY_LEN];
     DisplayMode  _mode;
+    NSTimeInterval _interval;
     NSTimer     *_timer;
 }
 @end
@@ -384,6 +385,7 @@ static NSImage *render_per_core_graphs(CPUState *state,
     memset(_perCoreHistory, 0, sizeof(_perCoreHistory));
     _topo = query_topology();
     _mode = DisplayModeAggregate;
+    _interval = UPDATE_SEC;
 
     // Two samples so deltas are valid on first render
     sample_cpu(&_cpuState);
@@ -474,12 +476,45 @@ static NSImage *render_per_core_graphs(CPUState *state,
         [menu addItem:item];
     }
 
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // Interval submenu
+    NSMenuItem *intervalItem = [[NSMenuItem alloc] initWithTitle:@"Update Interval"
+                                                          action:nil
+                                                   keyEquivalent:@""];
+    NSMenu *intervalMenu = [[NSMenu alloc] init];
+    int intervals[] = { 1, 2, 5, 10 };
+    for (int i = 0; i < 4; i++) {
+        NSString *title = [NSString stringWithFormat:@"%ds", intervals[i]];
+        NSMenuItem *sub = [[NSMenuItem alloc] initWithTitle:title
+                                                     action:@selector(selectInterval:)
+                                              keyEquivalent:@""];
+        [sub setTarget:self];
+        [sub setTag:intervals[i]];
+        if ((int)_interval == intervals[i])
+            [sub setState:NSControlStateValueOn];
+        [intervalMenu addItem:sub];
+    }
+    [intervalItem setSubmenu:intervalMenu];
+    [menu addItem:intervalItem];
+
     return menu;
 }
 
 - (void)selectMode:(NSMenuItem *)sender {
     _mode = (DisplayMode)[sender tag];
     [self updateIcon];
+}
+
+- (void)selectInterval:(NSMenuItem *)sender {
+    _interval = (NSTimeInterval)[sender tag];
+    [_timer invalidate];
+    _timer = [NSTimer scheduledTimerWithTimeInterval:_interval
+                                              target:self
+                                            selector:@selector(tick:)
+                                            userInfo:nil
+                                             repeats:YES];
+    [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
