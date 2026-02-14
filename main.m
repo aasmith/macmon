@@ -116,7 +116,8 @@ static CoreTopology query_topology(void) {
 
 static int is_e_core(unsigned cpu_index, CoreTopology *topo) {
     if (topo->e_cores == 0) return 0;  // no heterogeneous topology
-    return cpu_index >= topo->p_cores;
+    // host_processor_info lists E-cores first, then P-cores
+    return cpu_index < topo->e_cores;
 }
 
 // ============================================================================
@@ -269,8 +270,8 @@ static NSImage *render_per_core(CPUState *state, CoreTopology *topo) {
         }
 
         x += bar_w;
-        // wider gap at P/E boundary
-        if (topo->e_cores > 0 && i + 1 == topo->p_cores)
+        // wider gap at E/P boundary
+        if (topo->e_cores > 0 && i + 1 == topo->e_cores)
             x += group_gap;
         else
             x += gap;
