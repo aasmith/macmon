@@ -13,7 +13,12 @@
 #define ICON_PX      256
 #define UPDATE_SEC   1.0
 
-typedef enum { DisplayModeAggregate, DisplayModePerCore } DisplayMode;
+typedef enum {
+    DisplayModeAggregate,
+    DisplayModePerCore,
+    DisplayModePerCoreGraphs,
+    DisplayModeCount // sentinel for cycling
+} DisplayMode;
 
 // ============================================================================
 // CPU State
@@ -207,6 +212,93 @@ static NSImage *render_per_core(CPUState *state) {
     return img;
 }
 
+static void draw_mini_graph(CGContextRef ctx, float *hist, int len,
+                            float ox, float oy, float gw, float gh,
+                            float r, float g, float b) {
+    // filled area
+    CGContextSetRGBFillColor(ctx, r, g, b, 0.25f);
+    CGContextMoveToPoint(ctx, ox, oy);
+    for (int i = 0; i < len; i++) {
+        float x = ox + (gw * i) / (len - 1);
+        float y = oy + gh * hist[i];
+        CGContextAddLineToPoint(ctx, x, y);
+    }
+    CGContextAddLineToPoint(ctx, ox + gw, oy);
+    CGContextClosePath(ctx);
+    CGContextFillPath(ctx);
+
+    // stroke
+    CGContextSetRGBStrokeColor(ctx, r, g, b, 1.0f);
+    CGContextSetLineWidth(ctx, 1.5f);
+    CGContextSetLineJoin(ctx, kCGLineJoinRound);
+    for (int i = 0; i < len; i++) {
+        float x = ox + (gw * i) / (len - 1);
+        float y = oy + gh * hist[i];
+        if (i == 0) CGContextMoveToPoint(ctx, x, y);
+        else        CGContextAddLineToPoint(ctx, x, y);
+    }
+    CGContextStrokePath(ctx);
+}
+
+static NSImage *render_per_core_graphs(CPUState *state,
+                                       float per_core_history[][HISTORY_LEN]) {
+    int w = ICON_PX, h = ICON_PX;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(
+        NULL, w, h, 8, 0, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+
+    draw_rounded_bg(ctx, w, h);
+
+    unsigned n = state->num_cpus;
+    if (n == 0) n = 1;
+
+    // compute grid: prefer tall layout (fewer cols, more rows) for tall cells
+    unsigned cols = 1, rows = n;
+    float best_score = 1e9f;
+    for (unsigned c = 1; c <= n; c++) {
+        unsigned r = (n + c - 1) / c;
+        if (r < c) continue;                // rows >= cols
+        if (c < 2 && n > 4) continue;       // at least 2 cols when many cores
+        unsigned waste = c * r - n;
+        float cell_ratio = (float)c / (float)r; // <1 = tall
+        float score = fabsf(cell_ratio - 0.4f) + waste * 0.3f;
+        if (score < best_score) { best_score = score; cols = c; rows = r; }
+    }
+
+    float pad = w * 0.06f;
+    float gap = 3.0f;
+    float area_w = w - pad * 2;
+    float area_h = h - pad * 2;
+    float cell_w = (area_w - gap * (cols - 1)) / cols;
+    float cell_h = (area_h - gap * (rows - 1)) / rows;
+
+    for (unsigned i = 0; i < n; i++) {
+        unsigned col = i % cols;
+        unsigned row = i / cols;
+        // flip row so core 0 is top-left (CG origin is bottom-left)
+        float ox = pad + col * (cell_w + gap);
+        float oy = pad + (rows - 1 - row) * (cell_h + gap);
+
+        // cell background
+        CGContextSetRGBFillColor(ctx, 0.15f, 0.15f, 0.15f, 1.0f);
+        CGContextFillRect(ctx, CGRectMake(ox, oy, cell_w, cell_h));
+
+        // line color based on current usage
+        CGFloat r, g, b;
+        usage_color(state->usage[i], &r, &g, &b);
+        draw_mini_graph(ctx, per_core_history[i], HISTORY_LEN,
+                        ox, oy, cell_w, cell_h, (float)r, (float)g, (float)b);
+    }
+
+    CGImageRef cgImg = CGBitmapContextCreateImage(ctx);
+    NSImage *img = [[NSImage alloc] initWithCGImage:cgImg
+                                               size:NSMakeSize(ICON_PTS, ICON_PTS)];
+    CGImageRelease(cgImg);
+    CGContextRelease(ctx);
+    return img;
+}
+
 // ============================================================================
 // App Delegate
 // ============================================================================
@@ -214,6 +306,7 @@ static NSImage *render_per_core(CPUState *state) {
 @interface AppDelegate : NSObject <NSApplicationDelegate> {
     CPUState    _cpuState;
     float       _history[HISTORY_LEN];
+    float       _perCoreHistory[MAX_CPUS][HISTORY_LEN];
     DisplayMode _mode;
     NSTimer    *_timer;
 }
@@ -225,6 +318,7 @@ static NSImage *render_per_core(CPUState *state) {
     (void)note;
     memset(&_cpuState, 0, sizeof(_cpuState));
     memset(_history,   0, sizeof(_history));
+    memset(_perCoreHistory, 0, sizeof(_perCoreHistory));
     _mode = DisplayModeAggregate;
 
     // Two samples so deltas are valid on first render
@@ -249,15 +343,29 @@ static NSImage *render_per_core(CPUState *state) {
     sample_cpu(&_cpuState);
     memmove(_history, _history + 1, sizeof(float) * (HISTORY_LEN - 1));
     _history[HISTORY_LEN - 1] = _cpuState.aggregate;
+    for (unsigned i = 0; i < _cpuState.num_cpus; i++) {
+        memmove(_perCoreHistory[i], _perCoreHistory[i] + 1,
+                sizeof(float) * (HISTORY_LEN - 1));
+        _perCoreHistory[i][HISTORY_LEN - 1] = _cpuState.usage[i];
+    }
     [self updateIcon];
 }
 
 - (void)updateIcon {
     NSImage *icon;
-    if (_mode == DisplayModeAggregate) {
-        icon = render_aggregate(_history);
-    } else {
-        icon = render_per_core(&_cpuState);
+    switch (_mode) {
+        case DisplayModeAggregate:
+            icon = render_aggregate(_history);
+            break;
+        case DisplayModePerCore:
+            icon = render_per_core(&_cpuState);
+            break;
+        case DisplayModePerCoreGraphs:
+            icon = render_per_core_graphs(&_cpuState, _perCoreHistory);
+            break;
+        default:
+            icon = render_aggregate(_history);
+            break;
     }
     [NSApp setApplicationIconImage:icon];
 }
@@ -265,8 +373,7 @@ static NSImage *render_per_core(CPUState *state) {
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)app
                     hasVisibleWindows:(BOOL)flag {
     (void)app; (void)flag;
-    _mode = (_mode == DisplayModeAggregate) ? DisplayModePerCore
-                                           : DisplayModeAggregate;
+    _mode = (_mode + 1) % DisplayModeCount;
     [self updateIcon];
     return NO;
 }
@@ -286,14 +393,17 @@ static NSImage *render_per_core(CPUState *state) {
 
     [menu addItem:[NSMenuItem separatorItem]];
 
-    // Toggle
-    NSString *toggleTitle = (_mode == DisplayModeAggregate)
-        ? @"Show Per-Core" : @"Show Aggregate";
-    NSMenuItem *toggleItem = [[NSMenuItem alloc] initWithTitle:toggleTitle
-                                                        action:@selector(toggleMode:)
-                                                 keyEquivalent:@""];
-    [toggleItem setTarget:self];
-    [menu addItem:toggleItem];
+    // Mode options
+    NSString *labels[] = { @"Aggregate", @"Per-Core Bars", @"Per-Core Graphs" };
+    for (int i = 0; i < DisplayModeCount; i++) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:labels[i]
+                                                      action:@selector(selectMode:)
+                                               keyEquivalent:@""];
+        [item setTarget:self];
+        [item setTag:i];
+        if (i == (int)_mode) [item setState:NSControlStateValueOn];
+        [menu addItem:item];
+    }
 
     [menu addItem:[NSMenuItem separatorItem]];
 
@@ -306,10 +416,8 @@ static NSImage *render_per_core(CPUState *state) {
     return menu;
 }
 
-- (void)toggleMode:(id)sender {
-    (void)sender;
-    _mode = (_mode == DisplayModeAggregate) ? DisplayModePerCore
-                                           : DisplayModeAggregate;
+- (void)selectMode:(NSMenuItem *)sender {
+    _mode = (DisplayMode)[sender tag];
     [self updateIcon];
 }
 
