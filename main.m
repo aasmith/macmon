@@ -8,6 +8,10 @@
 // Constants
 // ============================================================================
 
+#ifndef GIT_SHA
+#define GIT_SHA "unknown"
+#endif
+
 #define MAX_CPUS     128
 #define HISTORY_LEN  64
 #define ICON_PTS     128
@@ -116,7 +120,10 @@ static CoreTopology query_topology(void) {
 
 static int is_e_core(unsigned cpu_index, CoreTopology *topo) {
     if (topo->e_cores == 0) return 0;  // no heterogeneous topology
-    // host_processor_info lists E-cores first, then P-cores
+    // Empirically, host_processor_info lists E-cores first, then P-cores
+    // on Apple Silicon. This ordering is not documented by Apple and could
+    // change in future chips/OS versions — only affects visual styling,
+    // not CPU usage accuracy.
     return cpu_index < topo->e_cores;
 }
 
@@ -155,6 +162,7 @@ static CGContextRef get_render_ctx(void) {
         g_ctx = CGBitmapContextCreate(
             g_pixels, ICON_PX, ICON_PX, 8, ICON_PX * 4,
             g_colorSpace, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        CGContextSaveGState(g_ctx);  // seed the stack for first RestoreGState
     }
     // Reset state: clear pixels and reset clip/CTM
     CGContextRestoreGState(g_ctx);  // pop any saved state (no-op if empty)
